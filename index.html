@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="BTC">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0e14">
+<title>Bitcoin Price</title>
+<style>
+:root{--bg:#0b0e14;--fg:#f2f4f8;--mute:#8b93a7;--card:#141925;--up:#2ecc8f;--down:#ff5c6c;--accent:#f7931a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif}
+body{display:flex;flex-direction:column;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:700px;margin:0 auto}
+header{padding-top:18px}
+.label{color:var(--mute);font-size:14px;letter-spacing:.04em;text-transform:uppercase}
+#price{font-size:44px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:4px}
+#change{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:2px;min-height:24px}
+.up{color:var(--up)}.down{color:var(--down)}
+#seg{display:flex;background:var(--card);border-radius:12px;padding:3px;margin:16px 0 10px}
+#seg button{flex:1;border:0;background:none;color:var(--mute);font-size:16px;font-weight:600;padding:10px 0;border-radius:10px}
+#seg button.on{background:#262d3f;color:var(--fg)}
+#wrap{flex:1;min-height:240px;position:relative;touch-action:none}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#stats{display:flex;justify-content:space-between;color:var(--mute);font-size:13px;padding:8px 0 4px;font-variant-numeric:tabular-nums}
+#stats b{color:var(--fg);font-weight:600}
+footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
+#err{color:var(--down)}
+</style>
+</head>
+<body>
+<header>
+  <div class="label">Bitcoin · BTC/USD</div>
+  <div id="price">—</div>
+  <div id="change"></div>
+</header>
+<div id="seg">
+  <button data-h="1" class="on">1H</button>
+  <button data-h="3">3H</button>
+  <button data-h="24">24H</button>
+</div>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="stats"><span>Low <b id="lo">—</b></span><span>High <b id="hi">—</b></span></div>
+<footer>
+  <div id="upd">Loading…</div>
+  <div id="err"></div>
+  <div>Source: Coinbase Exchange spot (a BRTI constituent), auto-refreshes every minute. Not the CF Benchmarks BRTI itself.</div>
+</footer>
+<script>
+(function(){
+  var hours = 1, data = [], hoverIdx = -1, timer = null;
+  var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var priceEl = document.getElementById('price'), chEl = document.getElementById('change');
+  var fmt = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2});
+  var css = function(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()};
+
+  // Coinbase returns max 300 candles per request.
+  // 1H and 3H use 1-minute candles (60/180); 24H uses 5-minute candles (288).
+  function gran(h){ return h <= 3 ? 60 : 300; }
+
+  async function load(){
+    var h = hours, g = gran(h);
+    var end = new Date(), start = new Date(end.getTime() - h*3600*1000);
+    var url = 'https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity='+g+
+              '&start='+start.toISOString()+'&end='+end.toISOString();
+    try{
+      var r = await fetch(url, {cache:'no-store'});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      var rows = await r.json();
+      if(h !== hours) return; // selector changed mid-flight
+      // [time, low, high, open, close, volume], newest first
+      data = rows.map(function(x){return {t:x[0]*1000, p:x[4], lo:x[1], hi:x[2]}}).sort(function(a,b){return a.t-b.t});
+      document.getElementById('err').textContent = '';
+      document.getElementById('upd').textContent = 'Updated ' + new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit',second:'2-digit'});
+      hoverIdx = -1;
+      render();
+    }catch(e){
+      document.getElementById('err').textContent = 'Could not refresh (' + e.message + '). Retrying in 1 min.';
+    }
+  }
+
+  function render(){
+    if(!data.length) return;
+    var last = data[data.length-1], first = data[0];
+    var shown = hoverIdx >= 0 ? data[hoverIdx] : last;
+    priceEl.textContent = fmt.format(shown.p);
+    var d = shown.p - first.p, pct = d / first.p * 100;
+    chEl.className = d >= 0 ? 'up' : 'down';
+    var when = hoverIdx >= 0 ? ' · ' + new Date(shown.t).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ' · past ' + hours + 'h';
+    chEl.textContent = (d>=0?'▲ ':'▼ ') + fmt.format(Math.abs(d)) + ' (' + (d>=0?'+':'') + pct.toFixed(2) + '%)' + when;
+    var lo = Math.min.apply(null, data.map(function(x){return x.lo})), hi = Math.max.apply(null, data.map(function(x){return x.hi}));
+    document.getElementById('lo').textContent = fmt.format(lo);
+    document.getElementById('hi').textContent = fmt.format(hi);
+    draw(lo, hi, d >= 0);
+  }
+
+  function draw(lo, hi, up){
+    var w = cv.clientWidth, h = cv.clientHeight, dpr = window.devicePixelRatio || 1;
+    if(cv.width !== w*dpr || cv.height !== h*dpr){ cv.width = w*dpr; cv.height = h*dpr; }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    var padL = 4, padR = 58, padT = 10, padB = 22;
+    var cw = w - padL - padR, ch = h - padT - padB;
+    var ps = data.map(function(x){return x.p});
+    var mn = Math.min.apply(null, ps), mx = Math.max.apply(null, ps);
+    var span = (mx - mn) || 1; mn -= span*0.08; mx += span*0.08;
+    var t0 = data[0].t, t1 = data[data.length-1].t, ts = (t1 - t0) || 1;
+    var X = function(t){return padL + (t - t0)/ts*cw};
+    var Y = function(p){return padT + (1 - (p - mn)/(mx - mn))*ch};
+
+    // grid + y labels
+    ctx.font = '11px -apple-system, system-ui, sans-serif';
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    for(var i=0;i<=3;i++){
+      var p = mn + (mx-mn)*i/3, y = Y(p);
+      ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(padL+cw,y); ctx.stroke();
+      ctx.fillStyle = css('--mute');
+      ctx.fillText(Math.round(p).toLocaleString('en-US'), padL+cw+6, y);
+    }
+    // x labels
+    ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'center';
+    for(var k=0;k<=3;k++){
+      var tt = t0 + ts*k/3;
+      var lab = new Date(tt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+      var xx = X(tt); ctx.textAlign = k===0?'left':(k===3?'right':'center');
+      ctx.fillStyle = css('--mute'); ctx.fillText(lab, xx, h-5);
+    }
+    var col = up ? css('--up') : css('--down');
+    // area
+    var grad = ctx.createLinearGradient(0,padT,0,padT+ch);
+    grad.addColorStop(0, col + '55'); grad.addColorStop(1, col + '00');
+    ctx.beginPath();
+    data.forEach(function(d,i){ var x=X(d.t), y=Y(d.p); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.lineTo(X(t1), padT+ch); ctx.lineTo(X(t0), padT+ch); ctx.closePath();
+    ctx.fillStyle = grad; ctx.fill();
+    // line
+    ctx.beginPath();
+    data.forEach(function(d,i){ var x=X(d.t), y=Y(d.p); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.stroke();
+    // marker
+    var m = hoverIdx >= 0 ? data[hoverIdx] : data[data.length-1];
+    if(hoverIdx >= 0){
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(X(m.t),padT); ctx.lineTo(X(m.t),padT+ch); ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(X(m.t), Y(m.p), 4.5, 0, Math.PI*2); ctx.fill();
+    cv._geo = {padL:padL, cw:cw, t0:t0, ts:ts};
+  }
+
+  // touch scrubbing
+  function scrub(e){
+    if(!data.length || !cv._geo) return;
+    var g = cv._geo, rect = cv.getBoundingClientRect();
+    var t = g.t0 + ((e.clientX - rect.left - g.padL)/g.cw)*g.ts;
+    var best = 0, bd = Infinity;
+    data.forEach(function(d,i){ var dd = Math.abs(d.t - t); if(dd < bd){bd = dd; best = i;} });
+    hoverIdx = best; render();
+  }
+  var wrap = document.getElementById('wrap');
+  wrap.addEventListener('pointerdown', function(e){ wrap.setPointerCapture(e.pointerId); scrub(e); });
+  wrap.addEventListener('pointermove', function(e){ if(e.buttons || e.pointerType==='touch') scrub(e); });
+  ['pointerup','pointercancel'].forEach(function(n){ wrap.addEventListener(n, function(){ hoverIdx = -1; render(); }); });
+
+  // selector
+  document.querySelectorAll('#seg button').forEach(function(b){
+    b.addEventListener('click', function(){
+      document.querySelectorAll('#seg button').forEach(function(x){x.classList.remove('on')});
+      b.classList.add('on'); hours = +b.dataset.h; data = []; priceEl.textContent = '—'; load();
+    });
+  });
+
+  // auto-refresh once a minute, and when the app returns to the foreground
+  function start(){ clearInterval(timer); timer = setInterval(load, 60000); }
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden){ load(); start(); } });
+  window.addEventListener('resize', render);
+  load(); start();
+})();
+</script>
+</body>
+</html>
