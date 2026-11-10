@@ -26,6 +26,11 @@ header{padding-top:18px}
 canvas{position:absolute;inset:0;width:100%;height:100%}
 #stats{display:flex;justify-content:space-between;color:var(--mute);font-size:13px;padding:8px 0 4px;font-variant-numeric:tabular-nums}
 #stats b{color:var(--fg);font-weight:600}
+#fc{background:var(--card);border-radius:12px;padding:10px 14px;margin:6px 0 4px}
+.fcr{display:flex;justify-content:space-between;font-size:15px;padding:5px 0;font-variant-numeric:tabular-nums}
+.fcr span:first-child{color:var(--mute)}.fcr span:nth-child(2){font-weight:600}
+.fcr span:last-child{min-width:78px;text-align:right}
+#fcmsg{color:var(--mute);font-size:14px;padding:4px 0}
 footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
 #err{color:var(--down)}
 </style>
@@ -43,14 +48,160 @@ footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
 </div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <div id="stats"><span>Low <b id="lo">—</b></span><span>High <b id="hi">—</b></span></div>
+<div id="fc">
+  <div class="label">Forecast · LightGBM-style model</div>
+  <div id="fcmsg">Training model…</div>
+  <div id="fcrows"></div>
+</div>
 <footer>
   <div id="upd">Loading…</div>
   <div id="err"></div>
-  <div>Source: Coinbase Exchange spot (a BRTI constituent), auto-refreshes every minute. Not the CF Benchmarks BRTI itself.</div>
+  <div>Source: Coinbase Exchange spot (a BRTI constituent), auto-refreshes every minute. Not the CF Benchmarks BRTI itself. Forecast is experimental and not financial advice.</div>
 </footer>
 <script>
 (function(){
-  var hours = 1, data = [], hoverIdx = -1, timer = null;
+  var hours = 1, data = [], hoverIdx = -1, timer = null, fc = null;
+
+  /* ====== Forecast: JS port of btc_forecast.py ====== */
+  var HORIZONS = [5, 10, 15];
+  var FEATS = ['ret_1m','ret_3m','ret_5m','ret_10m','ret_15m','ret_30m','vol_5m','vol_15m','vol_30m','ema_ratio','vol_rel','hl_spread'];
+  var N_EST = 120, LR = 0.03, MAX_DEPTH = 3, MAX_LEAVES = 7, MIN_LEAF = 20, COLSAMPLE = 0.8, NBINS = 64;
+
+  function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; var t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+
+  // 1000 one-minute bars (Coinbase caps a request at 300 candles, so 4 x 250)
+  async function fetch1m(){
+    var end = Date.now(), map = {};
+    var reqs = [0,1,2,3].map(function(k){
+      var e = end - k*250*60000, s = e - 250*60000;
+      var url = 'https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start='+new Date(s).toISOString()+'&end='+new Date(e).toISOString();
+      return fetch(url,{cache:'no-store'}).then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
+    });
+    var parts = await Promise.all(reqs);
+    parts.forEach(function(rows){ rows.forEach(function(x){ map[x[0]] = {t:x[0]*1000, l:x[1], h:x[2], o:x[3], c:x[4], v:x[5]}; }); });
+    var bars = Object.keys(map).map(function(k){return map[k]}).sort(function(a,b){return a.t-b.t});
+    if(bars.length < 200) throw new Error('not enough bars');
+    return bars;
+  }
+
+  function logr(a,b){ return Math.log(a/b); }
+  function buildFeatures(bars){
+    var n = bars.length, close = bars.map(function(b){return b.c}), vol = bars.map(function(b){return b.v});
+    var ret1 = close.map(function(c,i){ return i>=1 ? logr(c,close[i-1]) : NaN; });
+    var F = FEATS.map(function(){ return new Array(n).fill(NaN); });
+    function retW(w){ return close.map(function(c,i){ return i>=w ? logr(c,close[i-w]) : NaN; }); }
+    [1,3,5,10,15,30].forEach(function(w,j){ F[j] = w===1 ? ret1 : retW(w); });
+    [5,15,30].forEach(function(w,j){
+      for(var i=w;i<n;i++){ // pandas rolling std, ddof=1
+        var m=0,k; for(k=i-w+1;k<=i;k++) m+=ret1[k]; m/=w;
+        var s=0; for(k=i-w+1;k<=i;k++) s+=(ret1[k]-m)*(ret1[k]-m);
+        F[6+j][i] = Math.sqrt(s/(w-1));
+      }
+    });
+    var a5=2/6, a20=2/21, e5=close[0], e20=close[0];
+    for(var i=0;i<n;i++){
+      if(i>0){ e5=a5*close[i]+(1-a5)*e5; e20=a20*close[i]+(1-a20)*e20; }
+      F[9][i] = e5/e20 - 1;
+      if(i>=19){ var s=0; for(var k=i-19;k<=i;k++) s+=vol[k]; F[10][i] = vol[i]/(s/20+1e-8); }
+      F[11][i] = (bars[i].h - bars[i].l)/close[i];
+    }
+    return {F:F, close:close, n:n};
+  }
+
+  function fitGBM(X, y, rng){
+    // X: array of rows (each length 12). Histogram-binned, leaf-wise gradient boosting (squared loss).
+    var n = X.length, nf = FEATS.length, f, i, b;
+    var bounds = [], bins = [];
+    for(f=0;f<nf;f++){
+      var col = X.map(function(r){return r[f]}), sorted = col.slice().sort(function(a,b){return a-b});
+      var th = [];
+      for(b=1;b<NBINS;b++){ var v = sorted[Math.floor(b*n/NBINS)]; if(!th.length || v>th[th.length-1]) th.push(v); }
+      bounds.push(th);
+      bins.push(col.map(function(v){ var lo=0, hi=th.length; while(lo<hi){ var mid=(lo+hi)>>1; if(v<=th[mid]) hi=mid; else lo=mid+1; } return lo; }));
+    }
+    var base = y.reduce(function(a,b){return a+b},0)/n, pred = new Array(n).fill(base), trees = [];
+    var nSel = Math.max(1, Math.round(COLSAMPLE*nf));
+
+    for(var t=0;t<N_EST;t++){
+      var g = new Array(n); for(i=0;i<n;i++) g[i] = y[i]-pred[i];
+      var idx = []; for(f=0;f<nf;f++) idx.push(f);
+      for(i=nf-1;i>0;i--){ var j=Math.floor(rng()*(i+1)), tmp=idx[i]; idx[i]=idx[j]; idx[j]=tmp; }
+      var sel = idx.slice(0,nSel);
+
+      var root = {rows:[], depth:0}; for(i=0;i<n;i++) root.rows.push(i);
+      var leaves = [root];
+      var findBest = function(node){
+        if(node.depth>=MAX_DEPTH || node.rows.length<2*MIN_LEAF){ node.best=null; return; }
+        var G=0, N=node.rows.length, r;
+        for(r=0;r<N;r++) G+=g[node.rows[r]];
+        var best=null;
+        for(var s=0;s<sel.length;s++){
+          var ff=sel[s], nb=bounds[ff].length+1, hs=new Array(nb).fill(0), hc=new Array(nb).fill(0), bf=bins[ff];
+          for(r=0;r<N;r++){ var row=node.rows[r], bb=bf[row]; hs[bb]+=g[row]; hc[bb]++; }
+          var gl=0, cl=0;
+          for(var k=0;k<nb-1;k++){
+            gl+=hs[k]; cl+=hc[k];
+            var cr=N-cl; if(cl<MIN_LEAF || cr<MIN_LEAF) continue;
+            var gr=G-gl, gain=gl*gl/cl+gr*gr/cr-G*G/N;
+            if(gain>1e-18 && (!best || gain>best.gain)) best={gain:gain,f:ff,k:k};
+          }
+        }
+        node.best=best;
+      };
+      findBest(root);
+      while(leaves.length<MAX_LEAVES){
+        var pick=-1;
+        for(i=0;i<leaves.length;i++) if(leaves[i].best && (pick<0 || leaves[i].best.gain>leaves[pick].best.gain)) pick=i;
+        if(pick<0) break;
+        var nd=leaves[pick], bs=nd.best, L=[], R=[];
+        nd.rows.forEach(function(row){ (bins[bs.f][row]<=bs.k ? L : R).push(row); });
+        nd.f=bs.f; nd.thr=bounds[bs.f][bs.k]; nd.l={rows:L,depth:nd.depth+1}; nd.r={rows:R,depth:nd.depth+1};
+        nd.rows=null; leaves.splice(pick,1,nd.l,nd.r);
+        findBest(nd.l); findBest(nd.r);
+      }
+      leaves.forEach(function(lf){
+        var s=0; lf.rows.forEach(function(row){ s+=g[row]; });
+        lf.v = LR * (s/lf.rows.length);
+        lf.rows.forEach(function(row){ pred[row]+=lf.v; });
+        lf.rows = null;
+      });
+      trees.push(root);
+    }
+    return function(x){
+      var out = base;
+      for(var t=0;t<trees.length;t++){ var nd=trees[t]; while(nd.l) nd = x[nd.f]<=nd.thr ? nd.l : nd.r; out+=nd.v; }
+      return out;
+    };
+  }
+
+  async function runForecast(){
+    var msg = document.getElementById('fcmsg'), box = document.getElementById('fcrows');
+    try{
+      var bars = await fetch1m();
+      var fb = buildFeatures(bars), n = fb.n, F = fb.F;
+      var maxH = Math.max.apply(null, HORIZONS), rows = [], first = 30;
+      var rowAt = function(i){ return F.map(function(col){return col[i]}); };
+      for(var i=first;i<=n-1-maxH;i++) rows.push(i);
+      var X = rows.map(rowAt), latest = rowAt(n-1);
+      if(latest.some(function(v){return !isFinite(v)})) throw new Error('incomplete features');
+      var last = bars[n-1], pts = [];
+      HORIZONS.forEach(function(h,hi){
+        var y = rows.map(function(i){ return logr(fb.close[i+h], fb.close[i]); });
+        var predict = fitGBM(X, y, mulberry32(42+hi));
+        var lr = predict(latest);
+        pts.push({h:h, t:last.t+h*60000, price:last.c*Math.exp(lr), pct:(Math.exp(lr)-1)*100});
+      });
+      fc = {t:last.t, price0:last.c, pts:pts};
+      msg.textContent = 'Based on ' + new Date(last.t).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'}) + ' bar at ' + fmt.format(last.c);
+      box.innerHTML = pts.map(function(p){
+        var cls = p.pct>=0 ? 'up' : 'down';
+        return '<div class="fcr"><span>'+p.h+' min · '+new Date(p.t).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})+'</span><span>'+fmt.format(p.price)+'</span><span class="'+cls+'">'+(p.pct>=0?'▲ +':'▼ ')+p.pct.toFixed(3)+'%</span></div>';
+      }).join('');
+      render();
+    }catch(e){
+      msg.textContent = 'Forecast unavailable (' + e.message + ')';
+    }
+  }
   var cv = document.getElementById('c'), ctx = cv.getContext('2d');
   var priceEl = document.getElementById('price'), chEl = document.getElementById('change');
   var fmt = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2});
@@ -104,9 +255,12 @@ footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
     var padL = 4, padR = 58, padT = 10, padB = 22;
     var cw = w - padL - padR, ch = h - padT - padB;
     var ps = data.map(function(x){return x.p});
+    if(fc) fc.pts.forEach(function(p){ ps.push(p.price); });
     var mn = Math.min.apply(null, ps), mx = Math.max.apply(null, ps);
     var span = (mx - mn) || 1; mn -= span*0.08; mx += span*0.08;
-    var t0 = data[0].t, t1 = data[data.length-1].t, ts = (t1 - t0) || 1;
+    var t0 = data[0].t, tLast = data[data.length-1].t, t1 = tLast;
+    if(fc) t1 = Math.max(t1, fc.pts[fc.pts.length-1].t);
+    var ts = (t1 - t0) || 1;
     var X = function(t){return padL + (t - t0)/ts*cw};
     var Y = function(p){return padT + (1 - (p - mn)/(mx - mn))*ch};
 
@@ -134,12 +288,22 @@ footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
     grad.addColorStop(0, col + '55'); grad.addColorStop(1, col + '00');
     ctx.beginPath();
     data.forEach(function(d,i){ var x=X(d.t), y=Y(d.p); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
-    ctx.lineTo(X(t1), padT+ch); ctx.lineTo(X(t0), padT+ch); ctx.closePath();
+    ctx.lineTo(X(tLast), padT+ch); ctx.lineTo(X(t0), padT+ch); ctx.closePath();
     ctx.fillStyle = grad; ctx.fill();
     // line
     ctx.beginPath();
     data.forEach(function(d,i){ var x=X(d.t), y=Y(d.p); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
     ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.stroke();
+    // forecast (dashed amber), anchored at the latest 1-minute bar
+    if(fc && fc.t >= t0){
+      var acc = css('--accent');
+      ctx.strokeStyle = acc; ctx.lineWidth = 2; ctx.setLineDash([5,4]);
+      ctx.beginPath(); ctx.moveTo(X(fc.t), Y(fc.price0));
+      fc.pts.forEach(function(p){ ctx.lineTo(X(p.t), Y(p.price)); });
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = acc;
+      fc.pts.forEach(function(p){ ctx.beginPath(); ctx.arc(X(p.t), Y(p.price), 3.5, 0, Math.PI*2); ctx.fill(); });
+    }
     // marker
     var m = hoverIdx >= 0 ? data[hoverIdx] : data[data.length-1];
     if(hoverIdx >= 0){
@@ -173,10 +337,11 @@ footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
   });
 
   // auto-refresh once a minute, and when the app returns to the foreground
-  function start(){ clearInterval(timer); timer = setInterval(load, 60000); }
-  document.addEventListener('visibilitychange', function(){ if(!document.hidden){ load(); start(); } });
+  function tick(){ load(); runForecast(); }
+  function start(){ clearInterval(timer); timer = setInterval(tick, 60000); }
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden){ tick(); start(); } });
   window.addEventListener('resize', render);
-  load(); start();
+  tick(); start();
 })();
 </script>
 </body>
