@@ -52,6 +52,9 @@ footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
   <div class="label">Forecast · LightGBM-style model</div>
   <div id="fcmsg">Training model…</div>
   <div id="fcrows"></div>
+  <div class="label" style="margin-top:12px;display:flex;justify-content:space-between"><span>Track record · avg error</span><a href="#" id="trkreset" style="color:var(--mute);text-transform:none;letter-spacing:0">reset</a></div>
+  <div style="color:var(--mute);font-size:12px;padding:2px 0">Model vs. "price stays put." Positive % = model is closer.</div>
+  <div id="fcstat"></div>
 </div>
 <footer>
   <div id="upd">Loading…</div>
@@ -174,6 +177,47 @@ footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
     };
   }
 
+  /* ====== Track record: score past forecasts against what actually happened ====== */
+  var TRK_KEY = 'btcfc_track_v1', trk = {pending:[], scored:{5:[],10:[],15:[]}};
+  try{ var rawT = localStorage.getItem(TRK_KEY); if(rawT){ var o = JSON.parse(rawT); if(o && o.pending && o.scored) trk = o; } }catch(e){}
+  function saveTrk(){ try{ localStorage.setItem(TRK_KEY, JSON.stringify(trk)); }catch(e){} }
+  function avg(a){ return a.reduce(function(x,y){return x+y},0)/a.length; }
+
+  function trackUpdate(bars, last, pts){
+    var byT = {}; bars.forEach(function(b){ byT[b.t] = b; });
+    var now = Date.now();
+    if(!trk.pending.some(function(e){ return e.t === last.t; })){
+      trk.pending.push({t:last.t, base:last.c, preds:pts.map(function(p){ return {h:p.h, price:p.price, done:false}; })});
+    }
+    trk.pending.forEach(function(e){
+      e.preds.forEach(function(p){
+        if(p.done) return;
+        var tt = e.t + p.h*60000, b = byT[tt];
+        if(b && tt + 60000 <= now){ // target bar has closed
+          var arr = trk.scored[p.h]; arr.push({m:Math.abs(p.price-b.c), b:Math.abs(e.base-b.c)});
+          if(arr.length > 500) arr.shift();
+          p.done = true;
+        } else if(now - tt > 30*60000){ p.done = true; } // missing bar; give up
+      });
+    });
+    trk.pending = trk.pending.filter(function(e){ return now - e.t < 3*3600000 && e.preds.some(function(p){ return !p.done; }); });
+    saveTrk();
+  }
+
+  function trackRender(){
+    document.getElementById('fcstat').innerHTML = HORIZONS.map(function(h){
+      var a = trk.scored[h];
+      if(!a.length) return '<div class="fcr"><span>'+h+' min</span><span>waiting for results…</span><span></span></div>';
+      var m = avg(a.map(function(x){return x.m})), b = avg(a.map(function(x){return x.b}));
+      var better = m < b, diff = b > 0 ? (1 - m/b)*100 : 0;
+      return '<div class="fcr"><span>'+h+' min · n='+a.length+'</span><span>$'+m.toFixed(0)+' vs $'+b.toFixed(0)+'</span><span class="'+(better?'up':'down')+'">'+(diff>=0?'+':'')+diff.toFixed(0)+'%</span></div>';
+    }).join('');
+  }
+  document.getElementById('trkreset').addEventListener('click', function(e){
+    e.preventDefault(); trk = {pending:[], scored:{5:[],10:[],15:[]}}; saveTrk(); trackRender();
+  });
+  trackRender();
+
   async function runForecast(){
     var msg = document.getElementById('fcmsg'), box = document.getElementById('fcrows');
     try{
@@ -192,6 +236,7 @@ footer{color:var(--mute);font-size:12px;padding:6px 0 12px;line-height:1.4}
         pts.push({h:h, t:last.t+h*60000, price:last.c*Math.exp(lr), pct:(Math.exp(lr)-1)*100});
       });
       fc = {t:last.t, price0:last.c, pts:pts};
+      trackUpdate(bars, last, pts); trackRender();
       msg.textContent = 'Based on ' + new Date(last.t).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'}) + ' bar at ' + fmt.format(last.c);
       box.innerHTML = pts.map(function(p){
         var cls = p.pct>=0 ? 'up' : 'down';
